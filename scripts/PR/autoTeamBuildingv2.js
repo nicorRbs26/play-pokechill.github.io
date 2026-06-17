@@ -1,0 +1,388 @@
+```javascript
+// Constants
+const DEFAULT_AUTO_TEAM_WEIGHTS = { offense: 0.6, defense: 0.4 };
+const MAX_TEAM_SIZE = 6;
+const DIVERSITY_PENALTY = 0.15;
+const MIN_DIVERSITY_SCORE = 0.7;
+
+// Configuration
+window.autoTeamWeights = { ...DEFAULT_AUTO_TEAM_WEIGHTS };
+
+// ======================
+// Core Utility Functions
+// ======================
+
+/**
+ * Clamps a value between 0 and 1
+ * @param {number} x - Input value
+ * @returns {number} Clamped value
+ */
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+/**
+ * Normalizes type data into an array of type strings
+ * @param {string|object|array} types - Type data to normalize
+ * @returns {string[]} Array of type strings
+ */
+const normalizeTypes = (types) => {
+  if (!types) return [];
+
+  if (Array.isArray(types)) {
+    return types
+      .map(t => typeof t === "string" ? t : (t?.id || t?.type || t?.name))
+      .filter(Boolean);
+  }
+
+  if (typeof types === "object") {
+    const t = types.id || types.type || types.name;
+    return t ? [t] : [];
+  }
+
+  return [types];
+};
+
+/**
+ * Extracts ID from various object formats
+ * @param {object|string} x - Input object
+ * @returns {string|null} Extracted ID or null
+ */
+const enemyId = (x) => {
+  if (!x) return null;
+  if (typeof x === "string") return x;
+  return x.id || x.pkmn || x.name || null;
+};
+
+// ======================
+// Area-Specific Handlers
+// ======================
+
+/**
+ * Handles special cases for enemy pool building
+ * @param {object} area - Area object
+ * @param {object} unique - Unique enemy pool
+ */
+const handleSpecialAreaCases = (area, unique) => {
+  if (area.id === "frontierSpiralingTower") {
+    const typeMap = {
+      normal: "silvally", fire: "scorbunny", grass: "gossifleur",
+      electric: "boltund", ice: "beartic", bug: "karrablast",
+      fighting: "mienfoo", steel: "registeel", dark: "absol",
+      ground: "trapinch", fairy: "togepi", ghost: "duskull",
+      psychic: "chingling", flying: "chingling", water: "wailord",
+      poison: "trubbish", rock: "rockruff", dragon: "druddigon"
+    };
+
+    const id = typeMap[saved.currentSpiralingType];
+    if (id) unique[id] = pkmn[id];
+  }
+
+  if (area.id === areas.frontierBattleFactory.id) {
+    const id = areas.frontierBattleFactory.icon.id;
+    if (id) unique[id] = pkmn[id];
+  }
+};
+
+// ======================
+// Team Building Core
+// ======================
+
+/**
+ * Builds enemy pool for current area
+ * @param {object} area - Area object
+ * @returns {object[]} Array of unique enemy pokemon
+ */
+const buildEnemyPool = (area) => {
+  if (!area) return [];
+
+  const pool = [];
+  const unique = {};
+
+  // Collect from team slots
+  if (area.team) {
+    for (const key in area.team) {
+      if (key.startsWith("slot") && !key.endsWith("Moves") && area.team[key]) {
+        pool.push(area.team[key]);
+      }
+    }
+  }
+
+  // Collect from spawns
+  if (pool.length === 0 && area.spawns) {
+    for (const tier in area.spawns) {
+      if (Array.isArray(area.spawns[tier])) {
+        pool.push(...area.spawns[tier]);
+      }
+    }
+  }
+
+  // Process unique enemies
+  for (const e of pool) {
+    const id = enemyId(e);
+    if (id) unique[id] = pkmn[id] || e;
+  }
+
+  handleSpecialAreaCases(area, unique);
+  return Object.values(unique);
+};
+
+/**
+ * Builds stat block for a pokemon
+ * @param {object} poke - Pokemon object
+ * @returns {object} Stat block with calculated values
+ */
+const buildStatBlock = (poke) => {
+  const ivs = poke?.ivs || {};
+  const bst = poke?.bst || {};
+
+  const statValue = (stat, iv) => (stat || 0) * (1 + (iv || 0) * 0.1);
+
+  return {
+    hp: statValue(bst.hp, ivs.hp),
+    atk: statValue(bst.atk, ivs.atk),
+    def: statValue(bst.def, ivs.def),
+    satk: statValue(bst.satk, ivs.satk),
+    sdef: statValue(bst.sdef, ivs.sdef),
+    spe: statValue(bst.spe, ivs.spe),
+    total: 0 // Will be calculated below
+  };
+};
+
+// Calculate total stats
+const statBlock = buildStatBlock(poke);
+statBlock.total = Object.values(statBlock).reduce((sum, val) => sum + val, 0);
+
+return statBlock;
+
+/**
+ * Calculates type effectiveness multiplier
+ * @param {string} attackerType - Attacker's type
+ * @param {string|array} defenderTypes - Defender's type(s)
+ * @returns {number} Effectiveness multiplier
+ */
+const typeEffectiveness = (attackerType, defenderTypes) => {
+  if (!defenderTypes?.length) return 1;
+
+  const normalizedTypes = Array.isArray(defenderTypes) ? defenderTypes : [defenderTypes];
+  return Math.max(...normalizedTypes.map(t => typeChart[attackerType]?.[t] || 1));
+};
+
+/**
+ * Scores a candidate pokemon against a single enemy
+ * @param {object} candidate - Candidate pokemon with stats
+ * @param {object} enemy - Enemy pokemon
+ * @returns {number} Score value
+ */
+const scoreCandidateAgainstEnemy = (candidate, enemy) => {
+  const enemyTypes = normalizeTypes(enemy?.type);
+  const candidateTypes = normalizeTypes(candidate.ref?.type);
+
+  const enemyAtk = enemy?.bst?.atk || 0;
+  const enemySatk = enemy?.bst?.satk || 0;
+  const enemyDef = enemy?.bst?.def || 0;
+  const enemySdef = enemy?.bst?.sdef || 0;
+
+  const enemyIsPhysicalAttacker = enemyAtk >= enemySatk;
+  const enemyIsPhysicallyBulky = enemyDef >= enemySdef;
+
+  const attackUsed = enemyIsPhysicallyBulky ? candidate.stats.satk : candidate.stats.atk;
+  const offensiveMultiplier = candidateTypes.length
+    ? Math.max(0, ...candidateTypes.map(t => typeEffectiveness(t, enemyTypes)))
+    : 1;
+
+  const bulk = candidate.stats.hp + (enemyIsPhysicalAttacker ? candidate.stats.def : candidate.stats.sdef);
+  const incomingMultipliers = enemyTypes.length
+    ? enemyTypes.map(t => typeEffectiveness(t, candidateTypes))
+    : [1];
+
+  const worstIncoming = Math.max(...incomingMultipliers);
+  const scoreDef = worstIncoming === 0 ? bulk * 10 : bulk / worstIncoming;
+
+  return (autoTeamWeights.offense * attackUsed * offensiveMultiplier) +
+         (autoTeamWeights.defense * scoreDef);
+};
+
+/**
+ * Calculates average score of candidate against multiple enemies
+ * @param {object} candidate - Candidate pokemon
+ * @param {array} enemies - Array of enemy pokemon
+ * @returns {number} Average score
+ */
+const averageCandidateScore = (candidate, enemies) => {
+  if (!enemies.length) return candidate.stats.total;
+
+  const totalScore = enemies.reduce(
+    (sum, enemy) => sum + scoreCandidateAgainstEnemy(candidate, enemy),
+    0
+  );
+
+  return totalScore / enemies.length;
+};
+
+// ======================
+// Team Selection
+// ======================
+
+/**
+ * Checks if pokemon is allowed in current area
+ * @param {object} poke - Pokemon object
+ * @param {object} area - Area object
+ * @returns {boolean} True if allowed
+ */
+const pokemonAllowedInArea = (poke, area) => {
+  if (!poke?.caught) return false;
+  if (!area || area.type !== "frontier") return true;
+
+  const allowed = allowedDivisionsByRotation[rotationFrontierCurrent];
+  return allowed.includes(returnPkmnDivision(poke));
+};
+
+/**
+ * Builds team using greedy algorithm with diversity consideration
+ * @param {array} enemies - Array of enemy pokemon
+ * @param {object} area - Area object
+ * @returns {array} Array of selected pokemon IDs
+ */
+const buildGreedyTeam = (enemies, area) => {
+  const candidates = Object.entries(pkmn)
+    .filter(([_, poke]) => pokemonAllowedInArea(poke, area))
+    .map(([id, poke]) => ({
+      id,
+      ref: poke,
+      stats: buildStatBlock(poke)
+    }));
+
+  const available = [...candidates];
+  const chosen = [];
+  const usedTypes = new Set();
+
+  while (chosen.length < MAX_TEAM_SIZE && available.length > 0) {
+    let bestIndex = 0;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < available.length; i++) {
+      const candidate = available[i];
+      const baseScore = averageCandidateScore(candidate, enemies);
+
+      const candidateTypes = normalizeTypes(candidate.ref?.type);
+      const overlap = candidateTypes.filter(t => usedTypes.has(t)).length;
+      const diversityPenalty = Math.max(MIN_DIVERSITY_SCORE, 1 - (overlap * DIVERSITY_PENALTY));
+      const adjustedScore = baseScore * diversityPenalty;
+
+      if (adjustedScore > bestScore) {
+        bestScore = adjustedScore;
+        bestIndex = i;
+      }
+    }
+
+    const picked = available.splice(bestIndex, 1)[0];
+    chosen.push(picked.id);
+    normalizeTypes(picked.ref?.type).forEach(t => usedTypes.add(t));
+  }
+
+  return chosen;
+};
+
+// ======================
+// UI Functions
+// ======================
+
+/**
+ * Updates the bias display and weights
+ * @param {number} pct - Percentage value (0-100)
+ */
+const setAutoTeamBiasFromPercent = (pct) => {
+  const off = clamp01(pct / 100);
+  const def = clamp01(1 - off);
+
+  window.autoTeamWeights.offense = off;
+  window.autoTeamWeights.defense = def;
+
+  const label = document.getElementById("settings-auto-team-label");
+  if (label) {
+    label.textContent = `Offense ${Math.round(off*100)}% / Defense ${Math.round(def*100)}%`;
+  }
+};
+
+/**
+ * Opens the auto team building UI
+ */
+const openAutoTeam = () => {
+  document.getElementById("tooltipTop").style.display = "none";
+  document.getElementById("tooltipTitle").innerHTML = "Team Auto-Build";
+
+  const currentTeam = saved.previewTeams[saved.currentPreviewTeam];
+  let itemCheckboxesHTML = '';
+
+  for (let i = 1; i <= 6; i++) {
+    const slotKey = `slot${i}`;
+    const itemName = currentTeam[slotKey].item || 'No item';
+
+    if (itemName === "No item") continue;
+
+    itemCheckboxesHTML += `
+      <label style="display:flex; align-items:center; gap:.5rem; font-size:0.9rem;">
+        <input id="settings-auto-team-lock-item-${i}" type="checkbox" />
+        Lock ${format(itemName)} (Slot ${i})
+      </label>`;
+  }
+
+  document.getElementById("tooltipMid").innerHTML = `Select your preference for the team (Your current team will be replaced by it)`;
+  document.getElementById("tooltipBottom").innerHTML = `
+    <span id="prevent-tooltip-exit"></span>
+    <div style="display:flex; flex-direction:column; gap:.35rem;">
+      <span style="opacity:.8;">
+        Left = Defensive, Right = Offensive
+      </span>
+      <input
+        id="settings-auto-team-bias"
+        type="range"
+        min="0"
+        max="100"
+        step="5"
+        value="50"
+      />
+      ${itemCheckboxesHTML}
+    </div>
+    <div
+      onclick="setAutoTeamBiasFromPercent(document.getElementById('settings-auto-team-bias').value);
+               autoBuildTeam();
+               closeTooltip()"
+      style="cursor:pointer; font-size:1.5rem; width:100%;"
+      class="auto-build-confirm"
+      id="prevent-tooltip-exit"
+    >
+      Auto-Build
+    </div>
+  `;
+
+  setAutoTeamBiasFromPercent(50);
+  openTooltip();
+};
+
+/**
+ * Automatically builds and sets a preview team
+ */
+const autoBuildTeam = () => {
+  const area = saved.currentAreaBuffer
+    ? areas[saved.currentAreaBuffer]
+    : saved.currentArea
+      ? areas[saved.currentArea]
+      : undefined;
+
+  if (!area) return;
+
+  const enemies = buildEnemyPool(area);
+  const optimizedTeam = buildGreedyTeam(enemies, area);
+  const currentTeam = saved.previewTeams[saved.currentPreviewTeam];
+
+  for (let i = 1; i <= MAX_TEAM_SIZE; i++) {
+    const slotKey = `slot${i}`;
+    const newPkmn = optimizedTeam[i - 1];
+    const lockThisItem = document.getElementById(`settings-auto-team-lock-item-${i}`)?.checked === true;
+
+    currentTeam[slotKey].pkmn = newPkmn || undefined;
+    if (!lockThisItem) currentTeam[slotKey].item = undefined;
+  }
+
+  updatePreviewTeam();
+};
